@@ -133,12 +133,25 @@ class MultiEngine:
                 self._maybe_enter(lane, symbol, duration, market, reading)
 
     def _sync_loss_cooldowns(self) -> None:
+        """Logs every newly-closed position with full PnL detail (so 'why was this
+        a loss' is answerable from the log alone: exit_reason tells you whether it
+        was a stop-out or simply resolved the wrong way), and updates the per-lane
+        post-loss cooldown clock.
+        """
         for p in self.broker.positions:
             if p.status != "closed" or p.id in self._seen_closed_ids:
                 continue
             self._seen_closed_ids.add(p.id)
-            if (p.pnl_usd or 0.0) < 0:
+            pnl_usd = p.pnl_usd or 0.0
+            if pnl_usd < 0:
                 self._last_loss_ts[p.lane] = p.exit_ts or time.time()
+            outcome = "WIN" if pnl_usd > 0 else ("LOSS" if pnl_usd < 0 else "FLAT")
+            self._log(
+                p.lane,
+                f"TRADE CLOSED [{outcome}]: {p.side} {p.market_slug} entry={p.entry_price:.3f} "
+                f"exit={p.exit_price:.3f} pnl=${pnl_usd:+.2f} ({p.pnl_pct:+.1f}%) reason={p.exit_reason}",
+                "trade" if pnl_usd >= 0 else "error",
+            )
 
     def _maybe_enter(
         self, lane: str, symbol: str, duration: str, market: ActiveMarket, reading: MomentumReading
@@ -153,38 +166,48 @@ class MultiEngine:
             return
         if abs(reading.pct_change) < cfg.momentum_threshold_pct:
             return
+
+        # Momentum threshold cleared from here on — every evaluation gets logged
+        # with its outcome (entered or the specific reason it was skipped), throttled
+        # to once per cooldown_sec so a persistent signal doesn't spam every tick.
         if now - self._last_entry_ts.get(lane, 0.0) < cfg.cooldown_sec:
             return
-        if now - self._last_loss_ts.get(lane, 0.0) < cfg.cooldown_after_loss_sec:
-            return
-        if self.broker.has_open_position_on(market.condition_id):
-            return
-        if market.seconds_elapsed > cfg.max_seconds_into_window:
-            return
-        if market.seconds_left < cfg.min_seconds_left:
-            return
-
-        confidence = None
-        if cfg.use_confidence_gate:
-            confidence = self.signal_confidence(lane, symbol, market)
-            if confidence is None or confidence < cfg.confidence_threshold:
-                return
-
-        ok, reason = self.broker.can_enter(symbol, duration)
-        if not ok:
-            return  # silently skip; portfolio limits are expected to bind sometimes
+        self._last_entry_ts[lane] = now
 
         side = "Up" if reading.pct_change > 0 else "Down"
+        skip_reason = None
+
+        if now - self._last_loss_ts.get(lane, 0.0) < cfg.cooldown_after_loss_sec:
+            remaining = cfg.cooldown_after_loss_sec - (now - self._last_loss_ts.get(lane, 0.0))
+            skip_reason = f"post-loss cooldown active ({remaining:.0f}s left)"
+        elif self.broker.has_open_position_on(market.condition_id):
+            skip_reason = "already have an open position on this round"
+        elif market.seconds_elapsed > cfg.max_seconds_into_window:
+            skip_reason = f"too late into round ({market.seconds_elapsed:.0f}s elapsed > max {cfg.max_seconds_into_window}s)"
+        elif market.seconds_left < cfg.min_seconds_left:
+            skip_reason = f"too close to round end ({market.seconds_left:.0f}s left < min {cfg.min_seconds_left}s)"
+
+        confidence = None
+        if skip_reason is None and cfg.use_confidence_gate:
+            confidence = self.signal_confidence(lane, symbol, market)
+            if confidence is None:
+                skip_reason = "confidence gate: not enough volatility data yet to compute"
+            elif confidence < cfg.confidence_threshold:
+                skip_reason = f"confidence gate: modeled win prob {confidence * 100:.1f}% < required {cfg.confidence_threshold * 100:.0f}%"
+
+        if skip_reason is None:
+            ok, reason = self.broker.can_enter(symbol, duration)
+            if not ok:
+                skip_reason = f"portfolio limit: {reason}"
+
         conf_str = f", confidence={confidence * 100:.1f}%" if confidence is not None else ""
-        self._log(
-            lane,
-            f"SIGNAL: {symbol} moved {reading.pct_change:+.3f}% in {reading.window_sec:.0f}s{conf_str} "
-            f"-> entering {side} on {market.slug}",
-            "signal",
-        )
-        # apply the cooldown for this attempt regardless of outcome — otherwise a
-        # persistently-failing entry (e.g. already priced in) retries every tick
-        self._last_entry_ts[lane] = now
+        base_msg = f"SIGNAL: {symbol} moved {reading.pct_change:+.3f}% in {reading.window_sec:.0f}s{conf_str} on {market.slug}"
+
+        if skip_reason is not None:
+            self._log(lane, f"{base_msg} -> SKIPPED: {skip_reason}", "signal")
+            return
+
+        self._log(lane, f"{base_msg} -> entering {side}", "signal")
         try:
             pos, fail_reason = self.broker.enter(symbol, duration, market, side)
         except Exception as e:  # noqa: BLE001
