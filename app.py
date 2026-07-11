@@ -1,7 +1,11 @@
-"""Streamlit GUI for the Polymarket latency-momentum bot.
-Runs BTC 5m + 15m ("lanes") in parallel under one shared portfolio.
+"""Streamlit dashboard for the Polymarket latency-momentum bot — a pure VIEWER.
 
-Run with:  streamlit run app.py
+The actual trading engine runs as its own always-on process (run_bot.py, via
+systemd), completely independent of this dashboard. This file only reads what
+that process has written to polybot.db, so the bot keeps trading whether or
+not anyone has this page open, whether or not your PC is even on.
+
+Run with:  streamlit run app.py   (viewing only — does not start trading)
 """
 from __future__ import annotations
 
@@ -11,8 +15,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from polybot import store
+from polybot.broker import Broker, Position
 from polybot.config import ALL_LANES, BotConfig, lane_label, lane_parts
-from polybot.engine import MultiEngine
 
 # --- palette (validated, see dataviz skill) ---
 C_BLUE = "#2a78d6"     # BTC
@@ -22,19 +27,19 @@ C_MUTED = "#898781"
 C_GRID = "#e1e0d9"
 
 SYMBOL_COLOR = {"BTCUSDT": C_BLUE}
+LIVE_STALE_AFTER_SEC = 20  # if the trading process hasn't written live_state in this long, flag it
 
 st.set_page_config(page_title="Polymarket Latency Bot", page_icon="⚡", layout="wide")
+store.init_db()
 
 
-@st.cache_resource
-def get_engine() -> MultiEngine:
-    # No arguments -> exactly one cache entry for the process lifetime, so the
-    # same engine (and its running background thread) survives every rerun,
-    # including a full page refresh. Config is live-patched onto it below instead
-    # of being part of the cache key — keying on the config previously meant any
-    # difference in sidebar state (e.g. widget defaults resetting on a fresh
-    # session) silently created a brand new, never-started engine.
-    return MultiEngine(BotConfig())
+def load_broker(cfg: BotConfig) -> Broker:
+    """Read-only Broker populated from the DB, so we can reuse its aggregate
+    calculations (exposure, drawdown, Kelly-relevant stats) without duplicating
+    that logic here."""
+    broker = Broker(cfg)
+    broker.positions = [Position(**row) for row in store.load_positions()]
+    return broker
 
 
 def sidebar_config() -> BotConfig:
@@ -160,12 +165,24 @@ def sidebar_config() -> BotConfig:
     )
     if st.sidebar.button("Save config"):
         cfg.save()
-        st.sidebar.success("Saved.")
+        st.sidebar.success("Saved — the trading process picks this up within ~5 seconds, no restart needed.")
     return cfg
 
 
-def render_portfolio_header(engine: MultiEngine):
-    broker = engine.broker
+def render_engine_status():
+    live = store.load_live_state()
+    if not live:
+        st.warning("No data from the trading process yet — it may still be starting up, or isn't running. Check `sudo systemctl status polybot-engine` on the server.")
+        return
+    newest = max(v["updated_ts"] for v in live.values())
+    age = time.time() - newest
+    if age <= LIVE_STALE_AFTER_SEC:
+        st.success(f"🟢 Trading engine is running (last update {age:.0f}s ago)")
+    else:
+        st.error(f"🔴 Trading engine looks stopped — last update was {age:.0f}s ago. Check `sudo systemctl status polybot-engine` on the server.")
+
+
+def render_portfolio_header(cfg: BotConfig, broker: Broker):
     exposure = broker.exposure_usd()
     available = broker.available_cash()
     realized = broker.realized_pnl_usd()
@@ -175,7 +192,7 @@ def render_portfolio_header(engine: MultiEngine):
     drawdown = broker._portfolio_drawdown_pct()
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Bankroll", f"${engine.config.bankroll_usd:,.2f}")
+    c1.metric("Bankroll", f"${cfg.bankroll_usd:,.2f}")
     c2.metric("Available cash", f"${available:,.2f}")
     c3.metric("Open exposure", f"${exposure:,.2f}", f"{len(broker.open_positions())} positions")
     c4.metric("Realized PnL (all-time)", f"${realized:+,.2f}")
@@ -184,12 +201,12 @@ def render_portfolio_header(engine: MultiEngine):
     c5.metric("PnL — last 24h", f"${pnl_24h:+,.2f}", f"{trades_24h} trades")
     c6.metric("Today's PnL", f"${today_pnl:+,.2f}")
     c7.metric("Drawdown from peak", f"{drawdown:.1f}%")
-    if engine.config.daily_loss_limit_usd > 0 and today_pnl <= -abs(engine.config.daily_loss_limit_usd):
+    if cfg.daily_loss_limit_usd > 0 and today_pnl <= -abs(cfg.daily_loss_limit_usd):
         st.error(f"Daily loss circuit breaker tripped (${today_pnl:+,.2f}) — no new trades will open until tomorrow.")
 
 
-def render_revenue_breakdown(engine: MultiEngine):
-    closed = [p for p in engine.broker.positions if p.status == "closed"]
+def render_revenue_breakdown(broker: Broker):
+    closed = [p for p in broker.positions if p.status == "closed"]
     if not closed:
         st.caption("No closed trades yet — revenue breakdown will populate as trades resolve.")
         return
@@ -229,9 +246,9 @@ def render_revenue_breakdown(engine: MultiEngine):
         st.dataframe(by_duration.reset_index().rename(columns={"pnl_usd": "total_pnl_usd"}), use_container_width=True)
 
 
-def lane_stats(engine: MultiEngine, lane: str) -> dict:
-    closed = [p for p in engine.broker.positions if p.status == "closed" and p.lane == lane]
-    open_pos = [p for p in engine.broker.open_positions() if p.lane == lane]
+def lane_stats(broker: Broker, lane: str) -> dict:
+    closed = [p for p in broker.positions if p.status == "closed" and p.lane == lane]
+    open_pos = [p for p in broker.open_positions() if p.lane == lane]
     wins = [p for p in closed if (p.pnl_usd or 0.0) > 0]
     losses = [p for p in closed if (p.pnl_usd or 0.0) <= 0]
     total_pnl = sum(p.pnl_usd or 0.0 for p in closed)
@@ -250,26 +267,27 @@ def lane_stats(engine: MultiEngine, lane: str) -> dict:
     }
 
 
-def render_lane_card(engine: MultiEngine, lane: str, key_prefix: str = "combined"):
+def render_lane_card(cfg: BotConfig, broker: Broker, lane: str, key_prefix: str = "combined"):
     symbol, duration = lane_parts(lane)
     color = SYMBOL_COLOR.get(symbol, C_MUTED)
 
-    price = engine.latest_price(symbol)
-    reading = engine.momentum(lane)
-    market = engine.active_market(lane)
-    stats = lane_stats(engine, lane)
-    window_label = f"{reading.window_sec:.0f}s" if (reading.ok and engine.config.multi_window_scan) else f"{engine.config.momentum_window_sec}s"
+    live = store.load_live_state().get(lane, {})
+    price = live.get("price")
+    pct_change = live.get("pct_change")
+    window_sec = live.get("window_sec")
+    stats = lane_stats(broker, lane)
+    window_label = f"{window_sec:.0f}s" if (pct_change is not None and cfg.multi_window_scan) else f"{cfg.momentum_window_sec}s"
 
     with st.container(border=True):
         st.markdown(f"### 🤖 {lane_label(lane)} agent")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Price", f"${price:,.2f}" if price else "—")
-        c2.metric(f"Momentum ({window_label})", f"{reading.pct_change:+.3f}%" if reading.ok else "—")
+        c2.metric(f"Momentum ({window_label})", f"{pct_change:+.3f}%" if pct_change is not None else "—")
         c3.metric("Agent PnL", f"${stats['total_pnl']:+,.2f}", f"{stats['n_trades']} trades")
         c4.metric("Win rate", f"{stats['win_rate']:.0f}%" if stats["win_rate"] is not None else "—")
 
-        if market:
-            st.caption(f"Round `{market.slug}` — {market.seconds_left:.0f}s left ({market.seconds_elapsed:.0f}s elapsed)")
+        if live.get("market_slug"):
+            st.caption(f"Round `{live['market_slug']}` — {live.get('seconds_left', 0):.0f}s left ({live.get('seconds_elapsed', 0):.0f}s elapsed)")
         else:
             st.caption("No active round found.")
 
@@ -279,7 +297,7 @@ def render_lane_card(engine: MultiEngine, lane: str, key_prefix: str = "combined
         else:
             st.caption("No open position.")
 
-        hist = engine.snapshot_momentum(lane)
+        hist = store.load_price_history(lane, since_ts=time.time() - 3600)
         if hist:
             df = pd.DataFrame(hist)
             df["time"] = pd.to_datetime(df["ts"], unit="s")
@@ -295,11 +313,10 @@ def render_lane_card(engine: MultiEngine, lane: str, key_prefix: str = "combined
             st.plotly_chart(fig, use_container_width=True, key=f"chart_{key_prefix}_{lane}")
 
 
-def render_agent_tab(engine: MultiEngine, lane: str):
-    symbol, duration = lane_parts(lane)
-    stats = lane_stats(engine, lane)
+def render_agent_tab(cfg: BotConfig, broker: Broker, lane: str):
+    stats = lane_stats(broker, lane)
 
-    render_lane_card(engine, lane, key_prefix="agent")
+    render_lane_card(cfg, broker, lane, key_prefix="agent")
     st.divider()
 
     st.subheader("Agent stats")
@@ -346,16 +363,16 @@ def render_agent_tab(engine: MultiEngine, lane: str):
         st.caption("No closed trades yet for this agent.")
 
     st.subheader(f"{lane_label(lane)} — event log")
-    events = list(reversed(engine.snapshot_events(lane)))[:100]
+    events = [e for e in store.load_events(300) if e["lane"] == lane or e["lane"] is None][:100]
     for e in events:
-        ts = time.strftime("%H:%M:%S", time.localtime(e.ts))
-        icon = {"signal": "🎯", "trade": "💰", "error": "⚠️", "info": "ℹ️"}.get(e.kind, "ℹ️")
-        st.text(f"{ts} {icon} {e.text}")
+        ts = time.strftime("%H:%M:%S", time.localtime(e["ts"]))
+        icon = {"signal": "🎯", "trade": "💰", "error": "⚠️", "info": "ℹ️"}.get(e["kind"], "ℹ️")
+        st.text(f"{ts} {icon} {e['text']}")
 
 
-def render_trade_log_tab(engine: MultiEngine):
+def render_trade_log_tab(cfg: BotConfig, broker: Broker):
     st.subheader("Trade log — every trade, every agent")
-    all_positions = sorted(engine.broker.positions, key=lambda p: p.entry_ts, reverse=True)
+    all_positions = sorted(broker.positions, key=lambda p: p.entry_ts, reverse=True)
     if not all_positions:
         st.caption("No trades yet.")
         return
@@ -376,7 +393,7 @@ def render_trade_log_tab(engine: MultiEngine):
             "pnl_%": round(p.pnl_pct, 2) if p.pnl_pct is not None else None,
             "pnl_$": round(p.pnl_usd, 2) if p.pnl_usd is not None else None,
             "exit_reason": p.exit_reason or "—",
-            "mode": "PAPER" if engine.config.paper_trading else "LIVE",
+            "mode": "PAPER" if cfg.paper_trading else "LIVE",
         })
     df = pd.DataFrame(rows)
 
@@ -405,32 +422,33 @@ def render_trade_log_tab(engine: MultiEngine):
         c4.metric("Total realized PnL", f"${closed_df['pnl_$'].sum():+,.2f}")
 
 
-def render_live_tab(engine: MultiEngine):
-    render_portfolio_header(engine)
+def render_live_tab(cfg: BotConfig, broker: Broker):
+    render_engine_status()
+    render_portfolio_header(cfg, broker)
     st.divider()
 
     cols = st.columns(2)
-    for i, lane in enumerate(engine.config.lanes):
+    for i, lane in enumerate(cfg.lanes):
         with cols[i % 2]:
-            render_lane_card(engine, lane)
+            render_lane_card(cfg, broker, lane)
 
     st.divider()
     st.subheader("Event log (all lanes)")
-    events = list(reversed(engine.snapshot_events()))[:150]
+    events = store.load_events(150)
     for e in events:
-        ts = time.strftime("%H:%M:%S", time.localtime(e.ts))
-        icon = {"signal": "🎯", "trade": "💰", "error": "⚠️", "info": "ℹ️"}.get(e.kind, "ℹ️")
-        tag = f"[{lane_label(e.lane)}] " if e.lane else ""
-        st.text(f"{ts} {icon} {tag}{e.text}")
+        ts = time.strftime("%H:%M:%S", time.localtime(e["ts"]))
+        icon = {"signal": "🎯", "trade": "💰", "error": "⚠️", "info": "ℹ️"}.get(e["kind"], "ℹ️")
+        tag = f"[{lane_label(e['lane'])}] " if e["lane"] else ""
+        st.text(f"{ts} {icon} {tag}{e['text']}")
 
 
-def render_history_tab(engine: MultiEngine):
+def render_history_tab(broker: Broker):
     st.subheader("Revenue breakdown")
-    render_revenue_breakdown(engine)
+    render_revenue_breakdown(broker)
 
     st.divider()
     st.subheader("All closed trades")
-    closed = [p for p in engine.broker.positions if p.status == "closed"]
+    closed = [p for p in broker.positions if p.status == "closed"]
     if not closed:
         st.caption("No closed trades yet.")
         return
@@ -450,45 +468,31 @@ def render_history_tab(engine: MultiEngine):
 
 def main():
     st.title("⚡ Polymarket Latency Bot")
-    st.caption("Binance momentum → Polymarket BTC Up/Down markets. 5m + 15m, in parallel. Paper-trades by default.")
+    st.caption(
+        "Binance momentum → Polymarket BTC Up/Down markets. 5m + 15m, in parallel. "
+        "This dashboard is a viewer — the bot trades in its own always-on server process "
+        "regardless of whether this page is open."
+    )
 
     cfg = sidebar_config()
-    engine = get_engine()
-    engine.config = cfg
-    engine.broker.config = cfg
-
-    # Auto-start on first load of a fresh engine (e.g. right after a service
-    # restart/deploy) so the bot is always trading without a manual click —
-    # this is a server-hosted bot, it shouldn't need a human to press Start.
-    if not engine.running:
-        engine.start()
-
-    c1, c2, c3 = st.columns([1, 1, 4])
-    if c1.button("▶ Start bot", disabled=engine.running, type="primary"):
-        engine.start()
-        st.rerun()
-    if c2.button("■ Stop bot", disabled=not engine.running):
-        engine.stop()
-        st.rerun()
-    c3.write("🟢 Running" if engine.running else "🔴 Stopped")
+    broker = load_broker(cfg)
 
     agent_tab_labels = [f"🤖 {lane_label(lane)}" for lane in cfg.lanes]
     tab_names = ["Combined dashboard"] + agent_tab_labels + ["Trade log", "Trade history / revenue"]
     tabs = st.tabs(tab_names)
 
     with tabs[0]:
-        render_live_tab(engine)
+        render_live_tab(cfg, broker)
     for i, lane in enumerate(cfg.lanes):
         with tabs[1 + i]:
-            render_agent_tab(engine, lane)
+            render_agent_tab(cfg, broker, lane)
     with tabs[1 + len(cfg.lanes)]:
-        render_trade_log_tab(engine)
+        render_trade_log_tab(cfg, broker)
     with tabs[2 + len(cfg.lanes)]:
-        render_history_tab(engine)
+        render_history_tab(broker)
 
-    if engine.running:
-        time.sleep(2)
-        st.rerun()
+    time.sleep(3)
+    st.rerun()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from typing import List, Optional
 
 import requests
 
+from . import store
 from .config import BotConfig
 from .market_finder import ActiveMarket
 from .polymarket_client import LiveClobClient, get_book_top
@@ -215,6 +216,7 @@ class Broker:
             market_end_ts=market.end_ts,
         )
         self.positions.append(pos)
+        store.save_position(pos)
         return pos, ""
 
     def _close(self, pos: Position, exit_price: float, reason: str) -> None:
@@ -229,6 +231,7 @@ class Broker:
         pos.exit_ts = time.time()
         pos.exit_reason = reason
         pos.pnl_usd, pos.pnl_pct = pos.unrealized(exit_price)
+        store.save_position(pos)
 
     def check_exits(self) -> None:
         for pos in self.open_positions():

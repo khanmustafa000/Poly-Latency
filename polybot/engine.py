@@ -12,6 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional
 
+from . import store
 from .binance_feed import BinanceFeed, MomentumReading
 from .broker import Broker
 from .config import BotConfig, lane_parts
@@ -28,6 +29,7 @@ class EngineEvent:
 
 class MultiEngine:
     def __init__(self, config: BotConfig):
+        store.init_db()
         self.config = config
         self.broker = Broker(config)
 
@@ -121,7 +123,16 @@ class MultiEngine:
                     }
                 )
 
+            store.save_price_point(lane, time.time(), price, reading.pct_change if reading.ok else None)
+
             market = self.finders[lane].get_active_market()
+            store.save_live_state(
+                lane, price, reading.pct_change if reading.ok else None,
+                reading.window_sec if reading.ok else None,
+                market.slug if market else None,
+                market.seconds_left if market else None,
+                market.seconds_elapsed if market else None,
+            )
             if market is None:
                 continue
             if self._last_market_slug.get(lane) != market.slug:
@@ -252,8 +263,10 @@ class MultiEngine:
         return 0.5 * (1 + math.erf(abs(z) / math.sqrt(2)))
 
     def _log(self, lane: Optional[str], text: str, kind: str = "info") -> None:
+        ts = time.time()
         with self._lock:
-            self.events.append(EngineEvent(ts=time.time(), text=text, kind=kind, lane=lane))
+            self.events.append(EngineEvent(ts=ts, text=text, kind=kind, lane=lane))
+        store.save_event(ts, lane, kind, text)
 
     # ---- read-only snapshots for the UI ----
 
