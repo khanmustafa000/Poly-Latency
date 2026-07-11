@@ -1,0 +1,6 @@
+streamlit>=1.35
+plotly>=5.20
+pandas>=2.0
+requests>=2.31
+websockets>=12.0
+py-clob-client>=0.19

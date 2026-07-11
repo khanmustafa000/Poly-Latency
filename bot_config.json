@@ -1,0 +1,41 @@
+{
+  "lanes": [
+    "BTCUSDT-5m",
+    "BTCUSDT-15m"
+  ],
+  "momentum_threshold_pct": 0.28,
+  "momentum_window_sec": 60,
+  "multi_window_scan": false,
+  "scan_windows_sec": [
+    5,
+    10,
+    15,
+    30,
+    60,
+    90,
+    120
+  ],
+  "max_entry_price": 0.85,
+  "warmup_sec": 15,
+  "cooldown_after_loss_sec": 60,
+  "daily_loss_limit_usd": 0.0,
+  "use_kelly_sizing": false,
+  "kelly_fraction": 0.25,
+  "kelly_max_pct": 0.25,
+  "kelly_min_trades": 5,
+  "use_confidence_gate": false,
+  "confidence_threshold": 0.65,
+  "confidence_vol_lookback_sec": 300,
+  "max_seconds_into_window": 240,
+  "min_seconds_left": 20,
+  "cooldown_sec": 30,
+  "stop_loss_pct": 30,
+  "hold_to_resolution": true,
+  "take_profit_pct": 0,
+  "bankroll_usd": 1000.0,
+  "per_trade_usd": 5.0,
+  "max_concurrent_positions": 4,
+  "max_concurrent_per_lane": 1,
+  "paper_trading": true,
+  "poll_interval_sec": 1.0
+}
