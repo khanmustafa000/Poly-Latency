@@ -27,9 +27,14 @@ st.set_page_config(page_title="Polymarket Latency Bot", page_icon="⚡", layout=
 
 
 @st.cache_resource
-def get_engine(cfg_dict: dict) -> MultiEngine:
-    cfg = BotConfig(**cfg_dict)
-    return MultiEngine(cfg)
+def get_engine() -> MultiEngine:
+    # No arguments -> exactly one cache entry for the process lifetime, so the
+    # same engine (and its running background thread) survives every rerun,
+    # including a full page refresh. Config is live-patched onto it below instead
+    # of being part of the cache key — keying on the config previously meant any
+    # difference in sidebar state (e.g. widget defaults resetting on a fresh
+    # session) silently created a brand new, never-started engine.
+    return MultiEngine(BotConfig())
 
 
 def sidebar_config() -> BotConfig:
@@ -446,7 +451,7 @@ def main():
     st.caption("Binance momentum → Polymarket BTC Up/Down markets. 5m + 15m, in parallel. Paper-trades by default.")
 
     cfg = sidebar_config()
-    engine = get_engine(cfg.__dict__)
+    engine = get_engine()
     engine.config = cfg
     engine.broker.config = cfg
 
