@@ -170,18 +170,19 @@ class Broker:
 
     # ---- trading ----
 
-    def enter(self, symbol: str, duration: str, market: ActiveMarket, side: str) -> Optional[Position]:
-        ok, _ = self.can_enter(symbol, duration)
+    def enter(self, symbol: str, duration: str, market: ActiveMarket, side: str) -> tuple[Optional[Position], str]:
+        ok, reason = self.can_enter(symbol, duration)
         if not ok:
-            return None
+            return None, reason
 
         token_id = market.up_token_id if side == "Up" else market.down_token_id
         book = get_book_top(token_id)
         if book.best_ask is None:
-            return None
+            return None, "no liquidity (empty order book)"
         entry_price = book.best_ask
         if entry_price > self.config.max_entry_price:
-            return None  # move already priced in; our edge is on the lag, not chasing
+            # move already priced in; our edge is on the lag, not chasing
+            return None, f"already priced in (ask={entry_price:.3f} > max {self.config.max_entry_price:.2f})"
         size_usd = self._lane_kelly_stake(symbol, duration) if self.config.use_kelly_sizing else self.config.per_trade_usd
         size_usd = min(size_usd, self.available_cash())
 
@@ -208,7 +209,7 @@ class Broker:
             market_end_ts=market.end_ts,
         )
         self.positions.append(pos)
-        return pos
+        return pos, ""
 
     def _close(self, pos: Position, exit_price: float, reason: str) -> None:
         if not self.config.paper_trading:

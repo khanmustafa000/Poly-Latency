@@ -182,15 +182,17 @@ class MultiEngine:
             f"-> entering {side} on {market.slug}",
             "signal",
         )
+        # apply the cooldown for this attempt regardless of outcome — otherwise a
+        # persistently-failing entry (e.g. already priced in) retries every tick
+        self._last_entry_ts[lane] = now
         try:
-            pos = self.broker.enter(symbol, duration, market, side)
+            pos, fail_reason = self.broker.enter(symbol, duration, market, side)
         except Exception as e:  # noqa: BLE001
             self._log(lane, f"Entry failed: {e}", "error")
             return
         if pos is None:
-            self._log(lane, "Entry skipped: no liquidity or portfolio limit hit.", "error")
+            self._log(lane, f"Entry skipped: {fail_reason}", "error")
             return
-        self._last_entry_ts[lane] = now
         self._log(
             lane,
             f"TRADE OPEN: {pos.side} {pos.market_slug} @ {pos.entry_price:.3f} "
