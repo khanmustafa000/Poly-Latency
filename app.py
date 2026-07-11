@@ -171,17 +171,19 @@ def render_portfolio_header(engine: MultiEngine):
     realized = broker.realized_pnl_usd()
 
     today_pnl = broker.realized_pnl_today_usd()
+    pnl_24h, trades_24h = broker.realized_pnl_last_24h_usd()
     drawdown = broker._portfolio_drawdown_pct()
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Bankroll", f"${engine.config.bankroll_usd:,.2f}")
     c2.metric("Available cash", f"${available:,.2f}")
     c3.metric("Open exposure", f"${exposure:,.2f}", f"{len(broker.open_positions())} positions")
-    c4.metric("Realized PnL", f"${realized:+,.2f}")
+    c4.metric("Realized PnL (all-time)", f"${realized:+,.2f}")
 
-    c5, c6 = st.columns(2)
-    c5.metric("Today's PnL", f"${today_pnl:+,.2f}")
-    c6.metric("Drawdown from peak", f"{drawdown:.1f}%")
+    c5, c6, c7 = st.columns(3)
+    c5.metric("PnL — last 24h", f"${pnl_24h:+,.2f}", f"{trades_24h} trades")
+    c6.metric("Today's PnL", f"${today_pnl:+,.2f}")
+    c7.metric("Drawdown from peak", f"{drawdown:.1f}%")
     if engine.config.daily_loss_limit_usd > 0 and today_pnl <= -abs(engine.config.daily_loss_limit_usd):
         st.error(f"Daily loss circuit breaker tripped (${today_pnl:+,.2f}) — no new trades will open until tomorrow.")
 
@@ -454,6 +456,12 @@ def main():
     engine = get_engine()
     engine.config = cfg
     engine.broker.config = cfg
+
+    # Auto-start on first load of a fresh engine (e.g. right after a service
+    # restart/deploy) so the bot is always trading without a manual click —
+    # this is a server-hosted bot, it shouldn't need a human to press Start.
+    if not engine.running:
+        engine.start()
 
     c1, c2, c3 = st.columns([1, 1, 4])
     if c1.button("▶ Start bot", disabled=engine.running, type="primary"):

@@ -106,6 +106,12 @@ class Broker:
                 total += p.pnl_usd or 0.0
         return total
 
+    def realized_pnl_last_24h_usd(self) -> tuple[float, int]:
+        """Rolling 24h window (not calendar day) — returns (total pnl, trade count)."""
+        cutoff = time.time() - 86400
+        closed = [p for p in self.positions if p.status == "closed" and (p.exit_ts or 0) >= cutoff]
+        return sum(p.pnl_usd or 0.0 for p in closed), len(closed)
+
     def _lane_kelly_stake(self, symbol: str, duration: str) -> float:
         """Quarter-Kelly by default, scaled down during portfolio drawdown and
         after loss streaks, scaled up slightly on win streaks, and penalized for
