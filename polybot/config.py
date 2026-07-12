@@ -86,9 +86,24 @@ class BotConfig:
     cooldown_sec: int = 30                   # min gap between two entries on the SAME lane
 
     # --- risk / exit (shared) ---
-    stop_loss_pct: float = 30.0              # exit if position value drops this % from entry
+    # Price-based stop is now a loose safety-net floor, not the primary trigger: binary
+    # option prices are highly convex near expiry and were whipsawing 30-40% within
+    # seconds on pure noise (BTC hadn't even moved) — 44% of stop-losses in the first
+    # trading batch were actually correct-direction calls shaken out this way. The
+    # BTC-reversal stop below is now the primary exit signal; this just catches
+    # genuine liquidity/mispricing blowouts.
+    stop_loss_pct: float = 45.0              # exit if position value drops this % from entry
     hold_to_resolution: bool = True          # if False, will also take profit at take_profit_pct
     take_profit_pct: float = 0.0             # 0 = disabled
+
+    # --- BTC-reversal stop: exits based on whether the underlying BTC price has
+    # actually moved against the position relative to the round's open/reference
+    # price, using the same z-score-of-volatility math as the dynamic entry
+    # threshold. This targets the real failure mode (the directional thesis is
+    # wrong) instead of reacting to the option's own price noise. ---
+    use_btc_reversal_stop: bool = True
+    btc_reversal_z: float = 1.0              # exit once the adverse move is this many sigma from the round's open price
+    btc_reversal_min_elapsed_sec: int = 15   # ignore reversal checks for this long after entry to avoid noise right after opening
 
     # --- portfolio / capital management ---
     bankroll_usd: float = 1000.0             # total capital the bot is allowed to risk

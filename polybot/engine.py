@@ -105,7 +105,12 @@ class MultiEngine:
     # ---- core loop step ----
 
     def _tick(self) -> None:
-        self.broker.check_exits()
+        cfg = self.config
+        btc_prices = {symbol: feed.latest_price() for symbol, feed in self.feeds.items()}
+        btc_sigmas = {
+            symbol: feed.realized_vol_per_sec(cfg.confidence_vol_lookback_sec) for symbol, feed in self.feeds.items()
+        }
+        self.broker.check_exits(btc_prices, btc_sigmas)
         self._sync_loss_cooldowns()
 
         for lane in self.config.lanes:
@@ -251,8 +256,9 @@ class MultiEngine:
             return
 
         self._log(lane, f"{base_msg} -> entering {side}", "signal")
+        round_open_price = self._get_round_open_price(lane, symbol, market)
         try:
-            pos, fail_reason = self.broker.enter(symbol, duration, market, side)
+            pos, fail_reason = self.broker.enter(symbol, duration, market, side, round_open_price)
         except Exception as e:  # noqa: BLE001
             self._log(lane, f"Entry failed: {e}", "error")
             return
@@ -265,6 +271,15 @@ class MultiEngine:
             f"(${pos.size_usd:.2f}, {'PAPER' if cfg.paper_trading else 'LIVE'})",
             "trade",
         )
+
+    def _get_round_open_price(self, lane: str, symbol: str, market: ActiveMarket) -> Optional[float]:
+        open_price = self._round_open_price.get(lane)
+        if open_price is None:
+            feed = self.feeds.get(symbol)
+            open_price = feed.price_at(market.start_ts) if feed else None
+            if open_price:
+                self._round_open_price[lane] = open_price
+        return open_price
 
     def signal_confidence(self, lane: str, symbol: str, market: ActiveMarket) -> Optional[float]:
         """Extra confirmation on top of the momentum trigger: models P(price stays
@@ -279,11 +294,7 @@ class MultiEngine:
         if feed is None:
             return None
 
-        open_price = self._round_open_price.get(lane)
-        if open_price is None:
-            open_price = feed.price_at(market.start_ts)
-            if open_price:
-                self._round_open_price[lane] = open_price
+        open_price = self._get_round_open_price(lane, symbol, market)
         cur_price = feed.latest_price()
         seconds_left = max(1.0, market.seconds_left)
         sigma = feed.realized_vol_per_sec(cfg.confidence_vol_lookback_sec)

@@ -129,7 +129,23 @@ def sidebar_config() -> BotConfig:
     )
 
     st.sidebar.subheader("Risk / exit")
-    stop_loss = st.sidebar.slider("Stop loss (%)", 5, 100, int(saved.stop_loss_pct), 5)
+    use_btc_reversal_stop = st.sidebar.toggle(
+        "BTC-reversal stop (primary)", value=saved.use_btc_reversal_stop,
+        help="Exits based on whether BTC itself has moved against the position (z-score vs the round's open "
+             "price), not the option's own noisy bid price. Fixes stop-losses that were shaking out correct "
+             "calls purely on option-price whipsaw before BTC had actually reversed.",
+    )
+    btc_reversal_z = st.sidebar.slider(
+        "BTC reversal sigma", 0.25, 3.0, float(saved.btc_reversal_z), 0.25, disabled=not use_btc_reversal_stop,
+    )
+    btc_reversal_min_elapsed = st.sidebar.slider(
+        "Min seconds before reversal check", 0, 60, int(saved.btc_reversal_min_elapsed_sec), 5,
+        disabled=not use_btc_reversal_stop,
+    )
+    stop_loss = st.sidebar.slider(
+        "Stop loss (%) — price-based safety net", 5, 100, int(saved.stop_loss_pct), 5,
+        help="Loose fallback floor for genuine liquidity/mispricing blowouts, not the primary exit trigger.",
+    )
     hold = st.sidebar.checkbox("Hold to resolution (ignore take-profit)", value=saved.hold_to_resolution)
     take_profit = st.sidebar.slider("Take profit (%)", 0, 200, int(saved.take_profit_pct), 5, disabled=hold)
 
@@ -177,6 +193,9 @@ def sidebar_config() -> BotConfig:
         confidence_vol_lookback_sec=confidence_vol_lookback,
         use_edge_gate=use_edge_gate,
         min_edge_pct=min_edge_pct,
+        use_btc_reversal_stop=use_btc_reversal_stop,
+        btc_reversal_z=btc_reversal_z,
+        btc_reversal_min_elapsed_sec=btc_reversal_min_elapsed,
         stop_loss_pct=stop_loss,
         hold_to_resolution=hold,
         take_profit_pct=take_profit,

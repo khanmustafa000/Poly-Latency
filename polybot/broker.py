@@ -7,10 +7,11 @@ Live mode routes through LiveClobClient and places real orders.
 """
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import requests
 
@@ -36,6 +37,7 @@ class Position:
     shares: float
     entry_ts: float
     market_end_ts: float
+    round_open_price: Optional[float] = None  # BTC reference price the round resolves against
     status: str = "open"  # open | closed
     exit_price: Optional[float] = None
     exit_ts: Optional[float] = None
@@ -177,7 +179,9 @@ class Broker:
 
     # ---- trading ----
 
-    def enter(self, symbol: str, duration: str, market: ActiveMarket, side: str) -> tuple[Optional[Position], str]:
+    def enter(
+        self, symbol: str, duration: str, market: ActiveMarket, side: str, round_open_price: Optional[float] = None
+    ) -> tuple[Optional[Position], str]:
         ok, reason = self.can_enter(symbol, duration)
         if not ok:
             return None, reason
@@ -214,6 +218,7 @@ class Broker:
             shares=shares,
             entry_ts=time.time(),
             market_end_ts=market.end_ts,
+            round_open_price=round_open_price,
         )
         self.positions.append(pos)
         store.save_position(pos)
@@ -233,7 +238,12 @@ class Broker:
         pos.pnl_usd, pos.pnl_pct = pos.unrealized(exit_price)
         store.save_position(pos)
 
-    def check_exits(self) -> None:
+    def check_exits(
+        self, btc_prices: Optional[Dict[str, float]] = None, btc_sigmas: Optional[Dict[str, float]] = None
+    ) -> None:
+        btc_prices = btc_prices or {}
+        btc_sigmas = btc_sigmas or {}
+        cfg = self.config
         for pos in self.open_positions():
             now = time.time()
 
@@ -243,21 +253,51 @@ class Broker:
                     self._close(pos, final_price, "resolution")
                 continue
 
+            if cfg.use_btc_reversal_stop and self._btc_reversal_triggered(pos, now, btc_prices, btc_sigmas):
+                book = get_book_top(pos.token_id)
+                exit_price = book.best_bid if book.best_bid is not None else pos.entry_price
+                self._close(pos, exit_price, "btc_reversal")
+                continue
+
             book = get_book_top(pos.token_id)
             if book.best_bid is None:
                 continue
             _, pnl_pct = pos.unrealized(book.best_bid)
 
-            if pnl_pct <= -abs(self.config.stop_loss_pct):
+            if pnl_pct <= -abs(cfg.stop_loss_pct):
                 self._close(pos, book.best_bid, "stop_loss")
                 continue
 
             if (
-                not self.config.hold_to_resolution
-                and self.config.take_profit_pct > 0
-                and pnl_pct >= self.config.take_profit_pct
+                not cfg.hold_to_resolution
+                and cfg.take_profit_pct > 0
+                and pnl_pct >= cfg.take_profit_pct
             ):
                 self._close(pos, book.best_bid, "take_profit")
+
+    def _btc_reversal_triggered(
+        self, pos: Position, now: float, btc_prices: Dict[str, float], btc_sigmas: Dict[str, float]
+    ) -> bool:
+        """True once BTC itself has moved against the position by more than
+        btc_reversal_z sigma from the round's open/reference price — i.e. the
+        directional thesis the trade was based on is actually broken, as opposed
+        to the option's own price just being noisy.
+        """
+        cfg = self.config
+        elapsed = now - pos.entry_ts
+        if elapsed < cfg.btc_reversal_min_elapsed_sec:
+            return False
+        if not pos.round_open_price:
+            return False
+        cur_price = btc_prices.get(pos.symbol)
+        sigma = btc_sigmas.get(pos.symbol)
+        if not cur_price or not sigma or sigma <= 0:
+            return False
+
+        z = math.log(cur_price / pos.round_open_price) / (sigma * math.sqrt(elapsed))
+        if pos.side == "Up":
+            return z <= -abs(cfg.btc_reversal_z)
+        return z >= abs(cfg.btc_reversal_z)
 
     def _resolve_outcome(self, pos: Position) -> Optional[float]:
         """After the round ends, read the market's final settlement price (1.0 or 0.0).
