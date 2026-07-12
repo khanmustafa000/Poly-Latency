@@ -52,7 +52,20 @@ def sidebar_config() -> BotConfig:
             lanes.append(lane)
 
     st.sidebar.header("Momentum signal")
-    threshold = st.sidebar.slider("Threshold (%)", 0.02, 2.0, float(saved.momentum_threshold_pct), 0.02)
+    dynamic_threshold = st.sidebar.toggle(
+        "Dynamic threshold (relative to live BTC volatility)", value=saved.dynamic_threshold,
+        help="Instead of a fixed %, trigger when the move is unusual relative to BTC's own recent "
+             "volatility (z-score of sigma * sqrt(window)). Adapts to calm vs. volatile regimes "
+             "instead of a threshold that never fires in a quiet market or fires constantly in a busy one.",
+    )
+    dynamic_threshold_z = st.sidebar.slider(
+        "Dynamic threshold strength (sigma multiple)", 0.5, 4.0, float(saved.dynamic_threshold_z), 0.1,
+        disabled=not dynamic_threshold,
+        help="Trigger at |move| >= z * volatility * sqrt(window). Lower = more signals, more noise. Higher = fewer, stronger signals.",
+    )
+    threshold = st.sidebar.slider(
+        "Fixed threshold (%)", 0.02, 2.0, float(saved.momentum_threshold_pct), 0.02, disabled=dynamic_threshold,
+    )
     window = st.sidebar.slider("Window (seconds)", 5, 300, int(saved.momentum_window_sec), 5)
 
     st.sidebar.subheader("Multi-window scan")
@@ -137,6 +150,8 @@ def sidebar_config() -> BotConfig:
         lanes=lanes or list(ALL_LANES),
         momentum_threshold_pct=threshold,
         momentum_window_sec=window,
+        dynamic_threshold=dynamic_threshold,
+        dynamic_threshold_z=dynamic_threshold_z,
         multi_window_scan=multi_window,
         scan_windows_sec=scan_windows,
         max_seconds_into_window=max_in,

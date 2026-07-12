@@ -37,8 +37,14 @@ class BotConfig:
     lanes: List[str] = field(default_factory=lambda: list(ALL_LANES))
 
     # --- signal (shared across lanes) ---
-    momentum_threshold_pct: float = 0.3      # trigger if |move| >= this % ...
+    momentum_threshold_pct: float = 0.3      # trigger if |move| >= this % ... (used when dynamic_threshold is off)
     momentum_window_sec: int = 60            # ... within this many seconds
+
+    # --- dynamic threshold: instead of a fixed %, trigger when the move is
+    # statistically unusual relative to BTC's own recent volatility (z-score of
+    # sigma * sqrt(window)). Adapts automatically to calm vs. volatile regimes. ---
+    dynamic_threshold: bool = False
+    dynamic_threshold_z: float = 1.5         # trigger at |move| >= z * sigma_per_sec * sqrt(window_sec)
 
     # --- multi-window momentum scan: instead of one fixed lookback, check several and
     # take whichever shows the strongest move (only used if enabled) ---

@@ -175,7 +175,17 @@ class MultiEngine:
         if abs(reading.pct_change) > 20 or reading.window_sec > self.feeds[symbol].buffer_sec * 2:
             self._log(lane, f"Ignored implausible reading (pct={reading.pct_change:.2f}%, window={reading.window_sec:.0f}s) — likely a bad tick.", "error")
             return
-        if abs(reading.pct_change) < cfg.momentum_threshold_pct:
+        threshold_pct = cfg.momentum_threshold_pct
+        threshold_note = ""
+        if cfg.dynamic_threshold:
+            sigma = self.feeds[symbol].realized_vol_per_sec(cfg.confidence_vol_lookback_sec)
+            if sigma:
+                threshold_pct = cfg.dynamic_threshold_z * sigma * math.sqrt(reading.window_sec) * 100
+                threshold_note = f" (dynamic threshold={threshold_pct:.3f}% @ {cfg.dynamic_threshold_z}σ)"
+            else:
+                return  # not enough volatility data yet to size a dynamic threshold — wait rather than guess
+
+        if abs(reading.pct_change) < threshold_pct:
             return
 
         # Momentum threshold cleared from here on — every evaluation gets logged
@@ -212,7 +222,7 @@ class MultiEngine:
                 skip_reason = f"portfolio limit: {reason}"
 
         conf_str = f", confidence={confidence * 100:.1f}%" if confidence is not None else ""
-        base_msg = f"SIGNAL: {symbol} moved {reading.pct_change:+.3f}% in {reading.window_sec:.0f}s{conf_str} on {market.slug}"
+        base_msg = f"SIGNAL: {symbol} moved {reading.pct_change:+.3f}% in {reading.window_sec:.0f}s{threshold_note}{conf_str} on {market.slug}"
 
         if skip_reason is not None:
             self._log(lane, f"{base_msg} -> SKIPPED: {skip_reason}", "signal")
