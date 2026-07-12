@@ -113,16 +113,25 @@ def load_positions() -> List[dict]:
         return [dict(r) for r in rows]
 
 
+EVENTS_RETENTION = 6000  # generous enough to comfortably span a 6h snapshot window even during a chatty market
+
+
 def save_event(ts: float, lane: str | None, kind: str, text: str) -> None:
     with _conn() as conn:
         conn.execute("INSERT INTO events (ts,lane,kind,text) VALUES (?,?,?,?)", (ts, lane, kind, text))
-        conn.execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 800)")
+        conn.execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)", (EVENTS_RETENTION,))
         conn.commit()
 
 
 def load_events(limit: int = 300) -> List[dict]:
     with _conn() as conn:
         rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def load_events_since(since_ts: float) -> List[dict]:
+    with _conn() as conn:
+        rows = conn.execute("SELECT * FROM events WHERE ts >= ? ORDER BY ts", (since_ts,)).fetchall()
         return [dict(r) for r in rows]
 
 
