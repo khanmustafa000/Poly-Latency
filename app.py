@@ -494,15 +494,13 @@ def render_history_tab(broker: Broker):
     st.metric("Total realized PnL", f"${df['pnl_$'].sum():+.2f}")
 
 
-def main():
-    st.title("⚡ Polymarket Latency Bot")
-    st.caption(
-        "Binance momentum → Polymarket BTC Up/Down markets. 5m + 15m, in parallel. "
-        "This dashboard is a viewer — the bot trades in its own always-on server process "
-        "regardless of whether this page is open."
-    )
-
-    cfg = sidebar_config()
+@st.fragment(run_every=3)
+def render_dashboard_body(cfg: BotConfig) -> None:
+    """Everything that needs to auto-refresh lives in this fragment, which reruns
+    itself every 3s in isolation. Keeping this separate from the sidebar means a
+    "Save config" click there never races the auto-refresh and gets cancelled —
+    that was silently dropping saves before this was split out.
+    """
     broker = load_broker(cfg)
 
     agent_tab_labels = [f"🤖 {lane_label(lane)}" for lane in cfg.lanes]
@@ -519,8 +517,17 @@ def main():
     with tabs[2 + len(cfg.lanes)]:
         render_history_tab(broker)
 
-    time.sleep(3)
-    st.rerun()
+
+def main():
+    st.title("⚡ Polymarket Latency Bot")
+    st.caption(
+        "Binance momentum → Polymarket BTC Up/Down markets. 5m + 15m, in parallel. "
+        "This dashboard is a viewer — the bot trades in its own always-on server process "
+        "regardless of whether this page is open."
+    )
+
+    cfg = sidebar_config()
+    render_dashboard_body(cfg)
 
 
 if __name__ == "__main__":
