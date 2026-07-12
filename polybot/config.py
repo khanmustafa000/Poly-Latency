@@ -101,7 +101,16 @@ class BotConfig:
     poll_interval_sec: float = 1.0           # loop cadence for order-book polling / position checks
 
     def save(self, path: Path = CONFIG_PATH) -> None:
-        path.write_text(json.dumps(asdict(self), indent=2))
+        # write + fsync to a temp file then atomically replace, so a crash/hard
+        # reboot right after a save can't leave bot_config.json half-written or
+        # silently revert to a stale in-page-cache-only version.
+        import os
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp_path, "w") as f:
+            f.write(json.dumps(asdict(self), indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
 
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "BotConfig":
