@@ -117,6 +117,17 @@ def sidebar_config() -> BotConfig:
             "Volatility lookback (sec)", 30, 900, int(saved.confidence_vol_lookback_sec), 30, disabled=not use_confidence_gate,
         )
 
+    use_edge_gate = st.sidebar.toggle(
+        "Edge gate (fair value vs current price)", value=saved.use_edge_gate,
+        help="After a signal fires and picks Up/Down, checks the modeled fair value (same win-probability "
+             "model as the confidence gate) against the side's CURRENT market price. Only buys if fair value "
+             "sits at least the required % above what we'd pay — i.e. the BTC move should still move this "
+             "price, not already be priced in.",
+    )
+    min_edge_pct = st.sidebar.slider(
+        "Min required edge (%)", 1.0, 100.0, float(saved.min_edge_pct), 1.0, disabled=not use_edge_gate,
+    )
+
     st.sidebar.subheader("Risk / exit")
     stop_loss = st.sidebar.slider("Stop loss (%)", 5, 100, int(saved.stop_loss_pct), 5)
     hold = st.sidebar.checkbox("Hold to resolution (ignore take-profit)", value=saved.hold_to_resolution)
@@ -164,6 +175,8 @@ def sidebar_config() -> BotConfig:
         use_confidence_gate=use_confidence_gate,
         confidence_threshold=confidence_threshold,
         confidence_vol_lookback_sec=confidence_vol_lookback,
+        use_edge_gate=use_edge_gate,
+        min_edge_pct=min_edge_pct,
         stop_loss_pct=stop_loss,
         hold_to_resolution=hold,
         take_profit_pct=take_profit,

@@ -17,6 +17,7 @@ from .binance_feed import BinanceFeed, MomentumReading
 from .broker import Broker
 from .config import BotConfig, lane_parts
 from .market_finder import ActiveMarket, MarketFinder
+from .polymarket_client import get_book_top
 
 
 @dataclass
@@ -216,13 +217,34 @@ class MultiEngine:
             elif confidence < cfg.confidence_threshold:
                 skip_reason = f"confidence gate: modeled win prob {confidence * 100:.1f}% < required {cfg.confidence_threshold * 100:.0f}%"
 
+        edge_pct = None
+        current_price = None
+        if skip_reason is None and cfg.use_edge_gate:
+            if confidence is None:
+                confidence = self.signal_confidence(lane, symbol, market)
+            token_id = market.up_token_id if side == "Up" else market.down_token_id
+            book = get_book_top(token_id)
+            current_price = book.best_ask
+            if confidence is None:
+                skip_reason = "edge gate: not enough volatility data yet to model fair value"
+            elif not current_price:
+                skip_reason = "edge gate: no liquidity (empty order book) to price the edge"
+            else:
+                edge_pct = (confidence - current_price) / current_price * 100
+                if edge_pct < cfg.min_edge_pct:
+                    skip_reason = (
+                        f"edge gate: modeled fair value {confidence:.3f} vs current price {current_price:.3f} "
+                        f"= {edge_pct:+.1f}% edge < required {cfg.min_edge_pct:.0f}%"
+                    )
+
         if skip_reason is None:
             ok, reason = self.broker.can_enter(symbol, duration)
             if not ok:
                 skip_reason = f"portfolio limit: {reason}"
 
         conf_str = f", confidence={confidence * 100:.1f}%" if confidence is not None else ""
-        base_msg = f"SIGNAL: {symbol} moved {reading.pct_change:+.3f}% in {reading.window_sec:.0f}s{threshold_note}{conf_str} on {market.slug}"
+        edge_str = f", price={current_price:.3f}, edge={edge_pct:+.1f}%" if edge_pct is not None else ""
+        base_msg = f"SIGNAL: {symbol} moved {reading.pct_change:+.3f}% in {reading.window_sec:.0f}s{threshold_note}{conf_str}{edge_str} on {market.slug}"
 
         if skip_reason is not None:
             self._log(lane, f"{base_msg} -> SKIPPED: {skip_reason}", "signal")

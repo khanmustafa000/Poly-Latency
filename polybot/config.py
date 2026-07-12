@@ -73,6 +73,13 @@ class BotConfig:
     confidence_threshold: float = 0.65        # min modeled win probability (0-1) to enter
     confidence_vol_lookback_sec: int = 300    # window used to estimate live volatility for the model
 
+    # --- edge gate: compares that same modeled fair value against the side's
+    # CURRENT market price (the ask we'd actually pay). Only enters if the model
+    # says fair value sits at least min_edge_pct above the current price — i.e.
+    # the BTC move should be worth a real repricing, not one already priced in. ---
+    use_edge_gate: bool = True
+    min_edge_pct: float = 20.0                # required (modeled_fair_value - current_price) / current_price * 100
+
     # --- entry timing (shared) ---
     max_seconds_into_window: int = 240       # don't enter after this many seconds of the round have elapsed
     min_seconds_left: int = 20               # don't enter if less than this many seconds remain
