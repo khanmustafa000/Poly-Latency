@@ -105,6 +105,28 @@ class BotConfig:
     btc_reversal_z: float = 1.0              # exit once the adverse move is this many sigma from the round's open price
     btc_reversal_min_elapsed_sec: int = 15   # ignore reversal checks for this long after entry to avoid noise right after opening
 
+    # --- convergence filter: require independent technical signals (RSI mean-
+    # reversion, VWAP deviation, SMA crossover) to agree with the momentum-
+    # triggered direction before entering. A noise-level momentum blip rarely
+    # gets RSI/VWAP/SMA all pointing the same way at once, so this targets the
+    # genuinely-wrong-direction loss bucket (moves that were noise, not signal)
+    # that the edge/confidence gates don't catch. ---
+    use_convergence_filter: bool = True
+    convergence_min_agree: int = 2           # how many of {momentum, RSI, VWAP-dev, SMA-cross} must agree on direction
+    convergence_rsi_period: int = 14
+    convergence_sma_short_sec: int = 30      # short SMA window, in resampled buckets worth of seconds
+    convergence_sma_long_sec: int = 120
+    convergence_vwap_lookback_sec: int = 120
+    convergence_bucket_sec: int = 5          # resampling bucket width for the RSI/SMA close series
+
+    # --- skew-as-signal: folds how far the market's own price already sits from
+    # 50/50 into the modeled win-probability itself (contrarian discount when a
+    # side is already priced in, contrarian boost when the market is crowded
+    # the other way), instead of only checking mispricing after the fact via
+    # the edge gate. ---
+    use_skew_signal: bool = True
+    skew_signal_weight: float = 0.10         # max probability points the skew term can move the model by
+
     # --- portfolio / capital management ---
     bankroll_usd: float = 1000.0             # total capital the bot is allowed to risk
     per_trade_usd: float = 10.0              # stake per individual trade

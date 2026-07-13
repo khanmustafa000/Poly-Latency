@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional
 
-from . import store
+from . import indicators, store
 from .binance_feed import BinanceFeed, MomentumReading
 from .broker import Broker
 from .config import BotConfig, lane_parts
@@ -203,20 +203,31 @@ class MultiEngine:
 
         side = "Up" if reading.pct_change > 0 else "Down"
         skip_reason = None
+        convergence_note = ""
 
-        if now - self._last_loss_ts.get(lane, 0.0) < cfg.cooldown_after_loss_sec:
-            remaining = cfg.cooldown_after_loss_sec - (now - self._last_loss_ts.get(lane, 0.0))
-            skip_reason = f"post-loss cooldown active ({remaining:.0f}s left)"
-        elif self.broker.has_open_position_on(market.condition_id):
-            skip_reason = "already have an open position on this round"
-        elif market.seconds_elapsed > cfg.max_seconds_into_window:
-            skip_reason = f"too late into round ({market.seconds_elapsed:.0f}s elapsed > max {cfg.max_seconds_into_window}s)"
-        elif market.seconds_left < cfg.min_seconds_left:
-            skip_reason = f"too close to round end ({market.seconds_left:.0f}s left < min {cfg.min_seconds_left}s)"
+        if cfg.use_convergence_filter:
+            agree, total, detail = self._convergence_agreement(symbol, side, reading)
+            convergence_note = f", convergence={agree}/{total} [{detail}]"
+            if agree < cfg.convergence_min_agree:
+                skip_reason = (
+                    f"convergence filter: only {agree}/{total} indicators agree with {side} "
+                    f"(need {cfg.convergence_min_agree}) [{detail}]"
+                )
+
+        if skip_reason is None:
+            if now - self._last_loss_ts.get(lane, 0.0) < cfg.cooldown_after_loss_sec:
+                remaining = cfg.cooldown_after_loss_sec - (now - self._last_loss_ts.get(lane, 0.0))
+                skip_reason = f"post-loss cooldown active ({remaining:.0f}s left)"
+            elif self.broker.has_open_position_on(market.condition_id):
+                skip_reason = "already have an open position on this round"
+            elif market.seconds_elapsed > cfg.max_seconds_into_window:
+                skip_reason = f"too late into round ({market.seconds_elapsed:.0f}s elapsed > max {cfg.max_seconds_into_window}s)"
+            elif market.seconds_left < cfg.min_seconds_left:
+                skip_reason = f"too close to round end ({market.seconds_left:.0f}s left < min {cfg.min_seconds_left}s)"
 
         confidence = None
         if skip_reason is None and cfg.use_confidence_gate:
-            confidence = self.signal_confidence(lane, symbol, market)
+            confidence = self.signal_confidence(lane, symbol, market, side)
             if confidence is None:
                 skip_reason = "confidence gate: not enough volatility data yet to compute"
             elif confidence < cfg.confidence_threshold:
@@ -226,7 +237,7 @@ class MultiEngine:
         current_price = None
         if skip_reason is None and cfg.use_edge_gate:
             if confidence is None:
-                confidence = self.signal_confidence(lane, symbol, market)
+                confidence = self.signal_confidence(lane, symbol, market, side)
             token_id = market.up_token_id if side == "Up" else market.down_token_id
             book = get_book_top(token_id)
             current_price = book.best_ask
@@ -249,16 +260,21 @@ class MultiEngine:
 
         conf_str = f", confidence={confidence * 100:.1f}%" if confidence is not None else ""
         edge_str = f", price={current_price:.3f}, edge={edge_pct:+.1f}%" if edge_pct is not None else ""
-        base_msg = f"SIGNAL: {symbol} moved {reading.pct_change:+.3f}% in {reading.window_sec:.0f}s{threshold_note}{conf_str}{edge_str} on {market.slug}"
+        base_msg = f"SIGNAL: {symbol} moved {reading.pct_change:+.3f}% in {reading.window_sec:.0f}s{threshold_note}{convergence_note}{conf_str}{edge_str} on {market.slug}"
 
         if skip_reason is not None:
             self._log(lane, f"{base_msg} -> SKIPPED: {skip_reason}", "signal")
             return
 
+        # Always try to attach a modeled entry confidence, even if neither gate
+        # is enabled — this is what feeds the calibration table later, so we can
+        # measure whether stated confidence actually predicts win rate.
+        entry_confidence = confidence if confidence is not None else self.signal_confidence(lane, symbol, market, side)
+
         self._log(lane, f"{base_msg} -> entering {side}", "signal")
         round_open_price = self._get_round_open_price(lane, symbol, market)
         try:
-            pos, fail_reason = self.broker.enter(symbol, duration, market, side, round_open_price)
+            pos, fail_reason = self.broker.enter(symbol, duration, market, side, round_open_price, entry_confidence)
         except Exception as e:  # noqa: BLE001
             self._log(lane, f"Entry failed: {e}", "error")
             return
@@ -281,13 +297,20 @@ class MultiEngine:
                 self._round_open_price[lane] = open_price
         return open_price
 
-    def signal_confidence(self, lane: str, symbol: str, market: ActiveMarket) -> Optional[float]:
+    def signal_confidence(
+        self, lane: str, symbol: str, market: ActiveMarket, side: Optional[str] = None
+    ) -> Optional[float]:
         """Extra confirmation on top of the momentum trigger: models P(price stays
         on the just-triggered side until expiry), treating price as a driftless
         random walk. confidence = Phi(|z|), z = ln(current/round_open) /
         (sigma_per_sec * sqrt(seconds_left)) — the same closed-form math behind a
         zero-drift binary option price, driven by actual distance-from-open,
         time-left, and live realized volatility (not a guess).
+
+        If `side` is given and use_skew_signal is on, folds in a contrarian
+        adjustment based on how far the market's own current price already sits
+        from 50/50: discounts confidence when the side is already priced in,
+        boosts it when the market is crowded the other way.
         """
         cfg = self.config
         feed = self.feeds.get(symbol)
@@ -303,7 +326,61 @@ class MultiEngine:
             return None
 
         z = math.log(cur_price / open_price) / (sigma * math.sqrt(seconds_left))
-        return 0.5 * (1 + math.erf(abs(z) / math.sqrt(2)))
+        base = 0.5 * (1 + math.erf(abs(z) / math.sqrt(2)))
+
+        if side is None or not cfg.use_skew_signal:
+            return base
+
+        book = get_book_top(market.up_token_id)
+        market_up_price = book.best_ask if book.best_ask is not None else book.best_bid
+        skew = indicators.skew_signal(market_up_price)
+        if skew is None:
+            return base
+        skew_for_side = skew if side == "Up" else -skew
+        return max(0.0, min(1.0, base + cfg.skew_signal_weight * skew_for_side))
+
+    def _convergence_agreement(
+        self, symbol: str, side: str, reading: MomentumReading
+    ) -> tuple[int, int, str]:
+        """Counts how many independent signals (momentum itself, RSI mean-
+        reversion, VWAP deviation, SMA crossover) agree with the momentum-
+        triggered direction. Returns (agree_count, total_signals, human detail)."""
+        cfg = self.config
+        feed = self.feeds.get(symbol)
+        wanted_sign = 1.0 if side == "Up" else -1.0
+
+        signals: Dict[str, Optional[float]] = {"momentum": 1.0 if reading.pct_change > 0 else -1.0}
+
+        if feed is not None:
+            closes = feed.resampled_closes(cfg.convergence_bucket_sec, cfg.convergence_vwap_lookback_sec)
+            rsi_val = indicators.rsi(closes, cfg.convergence_rsi_period)
+            signals["rsi"] = indicators.rsi_signal(rsi_val)
+            signals["sma"] = indicators.sma_crossover_signal(
+                closes,
+                max(1, cfg.convergence_sma_short_sec // cfg.convergence_bucket_sec),
+                max(1, cfg.convergence_sma_long_sec // cfg.convergence_bucket_sec),
+            )
+            vwap_price = feed.vwap(cfg.convergence_vwap_lookback_sec)
+            signals["vwap"] = indicators.vwap_deviation_signal(feed.latest_price(), vwap_price)
+        else:
+            signals["rsi"] = None
+            signals["sma"] = None
+            signals["vwap"] = None
+
+        agree = 0
+        total = 0
+        parts = []
+        for name, sig in signals.items():
+            if sig is None:
+                parts.append(f"{name}=n/a")
+                continue
+            total += 1
+            if sig * wanted_sign > 0.05:
+                agree += 1
+                parts.append(f"{name}=+{sig:.2f}" if wanted_sign > 0 else f"{name}={sig:.2f}")
+            else:
+                parts.append(f"{name}={sig:.2f}")
+        return agree, max(total, 1), ", ".join(parts)
 
     def _log(self, lane: Optional[str], text: str, kind: str = "info") -> None:
         ts = time.time()

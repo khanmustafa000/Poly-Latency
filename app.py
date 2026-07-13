@@ -15,7 +15,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from polybot import store
+from polybot import calibration, store
 from polybot.broker import Broker, Position
 from polybot.config import ALL_LANES, BotConfig, lane_label, lane_parts
 
@@ -128,6 +128,35 @@ def sidebar_config() -> BotConfig:
         "Min required edge (%)", 1.0, 100.0, float(saved.min_edge_pct), 1.0, disabled=not use_edge_gate,
     )
 
+    use_skew_signal = st.sidebar.toggle(
+        "Skew-as-signal (contrarian probability adjustment)", value=saved.use_skew_signal,
+        help="Folds how far the market's own price already sits from 50/50 into the modeled win probability "
+             "itself: discounts confidence when the triggered side is already priced in, boosts it when the "
+             "market is crowded the other way. Complements the edge gate rather than replacing it.",
+    )
+    skew_signal_weight = st.sidebar.slider(
+        "Skew signal weight (max probability points)", 0.0, 0.30, float(saved.skew_signal_weight), 0.01,
+        disabled=not use_skew_signal,
+    )
+
+    st.sidebar.subheader("Convergence filter")
+    use_convergence_filter = st.sidebar.toggle(
+        "Require indicator agreement before entering", value=saved.use_convergence_filter,
+        help="Computes RSI mean-reversion, VWAP deviation, and SMA crossover alongside the momentum signal "
+             "and requires several of them to agree on direction before trading — filters out noise-level "
+             "momentum blips that a single indicator alone can't distinguish from a real move.",
+    )
+    convergence_min_agree = st.sidebar.slider(
+        "Min agreeing indicators (of 4, incl. momentum)", 1, 4, int(saved.convergence_min_agree), 1,
+        disabled=not use_convergence_filter,
+    )
+    with st.sidebar.expander("Convergence filter settings", expanded=False):
+        convergence_rsi_period = st.slider("RSI period (buckets)", 5, 30, int(saved.convergence_rsi_period), 1, disabled=not use_convergence_filter)
+        convergence_sma_short_sec = st.slider("SMA short window (sec)", 10, 120, int(saved.convergence_sma_short_sec), 5, disabled=not use_convergence_filter)
+        convergence_sma_long_sec = st.slider("SMA long window (sec)", 60, 600, int(saved.convergence_sma_long_sec), 10, disabled=not use_convergence_filter)
+        convergence_vwap_lookback_sec = st.slider("VWAP lookback (sec)", 30, 600, int(saved.convergence_vwap_lookback_sec), 10, disabled=not use_convergence_filter)
+        convergence_bucket_sec = st.slider("Resample bucket width (sec)", 1, 30, int(saved.convergence_bucket_sec), 1, disabled=not use_convergence_filter)
+
     st.sidebar.subheader("Risk / exit")
     use_btc_reversal_stop = st.sidebar.toggle(
         "BTC-reversal stop (primary)", value=saved.use_btc_reversal_stop,
@@ -193,6 +222,15 @@ def sidebar_config() -> BotConfig:
         confidence_vol_lookback_sec=confidence_vol_lookback,
         use_edge_gate=use_edge_gate,
         min_edge_pct=min_edge_pct,
+        use_skew_signal=use_skew_signal,
+        skew_signal_weight=skew_signal_weight,
+        use_convergence_filter=use_convergence_filter,
+        convergence_min_agree=convergence_min_agree,
+        convergence_rsi_period=convergence_rsi_period,
+        convergence_sma_short_sec=convergence_sma_short_sec,
+        convergence_sma_long_sec=convergence_sma_long_sec,
+        convergence_vwap_lookback_sec=convergence_vwap_lookback_sec,
+        convergence_bucket_sec=convergence_bucket_sec,
         use_btc_reversal_stop=use_btc_reversal_stop,
         btc_reversal_z=btc_reversal_z,
         btc_reversal_min_elapsed_sec=btc_reversal_min_elapsed,
@@ -489,9 +527,36 @@ def render_live_tab(cfg: BotConfig, broker: Broker):
         st.text(f"{ts} {icon} {tag}{e['text']}")
 
 
+def render_calibration(broker: Broker):
+    closed = [
+        {"entry_confidence": p.entry_confidence, "pnl_usd": p.pnl_usd}
+        for p in broker.positions if p.status == "closed"
+    ]
+    scored = [c for c in closed if c["entry_confidence"] is not None]
+    if not scored:
+        st.caption("No trades with a stated entry confidence yet — calibration data accumulates as new trades close.")
+        return
+
+    brier = calibration.brier_score(closed)
+    c1, c2 = st.columns(2)
+    c1.metric("Brier score (lower is better)", f"{brier:.3f}" if brier is not None else "—",
+               help="0 = perfectly calibrated, 0.25 = no better than a coin flip, higher = worse.")
+    c2.metric("Trades with a stated confidence", f"{len(scored)}")
+
+    rows = calibration.calibration_buckets(closed)
+    if rows:
+        st.caption("Compares each confidence bucket's *stated* win probability to its *realized* win rate. "
+                   "A large positive/negative gap means the model is over/under-confident in that band.")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+
 def render_history_tab(broker: Broker):
     st.subheader("Revenue breakdown")
     render_revenue_breakdown(broker)
+
+    st.divider()
+    st.subheader("Confidence calibration")
+    render_calibration(broker)
 
     st.divider()
     st.subheader("All closed trades")

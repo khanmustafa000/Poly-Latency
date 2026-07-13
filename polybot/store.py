@@ -30,7 +30,7 @@ def init_db() -> None:
                 token_id TEXT, side TEXT, entry_price REAL, size_usd REAL,
                 shares REAL, entry_ts REAL, market_end_ts REAL, status TEXT,
                 exit_price REAL, exit_ts REAL, exit_reason TEXT,
-                pnl_usd REAL, pnl_pct REAL, round_open_price REAL
+                pnl_usd REAL, pnl_pct REAL, round_open_price REAL, entry_confidence REAL
             )
             """
         )
@@ -65,6 +65,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE positions ADD COLUMN round_open_price REAL")
         except sqlite3.OperationalError:
             pass  # already exists (pre-existing DB from before this column was added)
+        try:
+            conn.execute("ALTER TABLE positions ADD COLUMN entry_confidence REAL")
+        except sqlite3.OperationalError:
+            pass  # already exists (pre-existing DB from before this column was added)
         conn.commit()
 
 
@@ -96,8 +100,8 @@ def save_position(pos) -> None:
             """
             INSERT INTO positions (id,symbol,duration,market_slug,condition_id,token_id,side,
                 entry_price,size_usd,shares,entry_ts,market_end_ts,status,exit_price,exit_ts,
-                exit_reason,pnl_usd,pnl_pct,round_open_price)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                exit_reason,pnl_usd,pnl_pct,round_open_price,entry_confidence)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 status=excluded.status, exit_price=excluded.exit_price, exit_ts=excluded.exit_ts,
                 exit_reason=excluded.exit_reason, pnl_usd=excluded.pnl_usd, pnl_pct=excluded.pnl_pct
@@ -106,7 +110,7 @@ def save_position(pos) -> None:
                 pos.id, pos.symbol, pos.duration, pos.market_slug, pos.condition_id, pos.token_id,
                 pos.side, pos.entry_price, pos.size_usd, pos.shares, pos.entry_ts, pos.market_end_ts,
                 pos.status, pos.exit_price, pos.exit_ts, pos.exit_reason, pos.pnl_usd, pos.pnl_pct,
-                pos.round_open_price,
+                pos.round_open_price, pos.entry_confidence,
             ),
         )
         conn.commit()

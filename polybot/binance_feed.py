@@ -35,7 +35,7 @@ class BinanceFeed:
     def __init__(self, symbol: str, buffer_sec: int = 600):
         self.symbol = symbol.lower()
         self.buffer_sec = buffer_sec
-        self._buf: Deque[Tuple[float, float]] = deque()
+        self._buf: Deque[Tuple[float, float, float]] = deque()  # (ts, price, qty)
         self._lock = Lock()
         self._connected = False
         self._last_error: Optional[str] = None
@@ -64,16 +64,16 @@ class BinanceFeed:
         with self._lock:
             if not self._buf:
                 return MomentumReading(ok=False)
-            last_ts, last_price = self._buf[-1]
+            last_ts, last_price, _ = self._buf[-1]
             ref_price = None
             ref_ts = None
-            for ts, price in self._buf:
+            for ts, price, _qty in self._buf:
                 if now - ts <= window_sec:
                     ref_price = price
                     ref_ts = ts
                     break
             if ref_price is None:
-                ref_price, ref_ts = self._buf[0]
+                ref_price, ref_ts = self._buf[0][1], self._buf[0][0]
         if ref_price <= 0 or last_price <= 0:
             return MomentumReading(ok=False)
         if ref_ts <= 0 or (now - ref_ts) > self.buffer_sec * 2:
@@ -107,7 +107,7 @@ class BinanceFeed:
         with self._lock:
             if not self._buf:
                 return None
-            candidates = [p for t, p in self._buf if t <= ts]
+            candidates = [p for t, p, _q in self._buf if t <= ts]
             if candidates:
                 return candidates[-1]
             return self._buf[0][1]
@@ -120,7 +120,7 @@ class BinanceFeed:
         """
         now = time.time()
         with self._lock:
-            pts = [(t, p) for t, p in self._buf if now - t <= lookback_sec]
+            pts = [(t, p) for t, p, _q in self._buf if now - t <= lookback_sec]
         if len(pts) < 5:
             return None
         variance_terms = []
@@ -135,15 +135,51 @@ class BinanceFeed:
         mean_var = sum(variance_terms) / len(variance_terms)
         return math.sqrt(mean_var) if mean_var > 0 else None
 
-    def _push(self, ts: float, price: float) -> None:
+    def resampled_closes(self, bucket_sec: int, lookback_sec: int) -> List[float]:
+        """Bucket recent ticks into fixed-width time bins and take the last price
+        in each bin (forward-filled from the prior bucket when a bin has no
+        ticks), producing an evenly-spaced close series for indicators (RSI, SMA)
+        that assume regular sampling rather than raw irregular tick data."""
+        now = time.time()
+        with self._lock:
+            pts = [(t, p) for t, p, _q in self._buf if now - t <= lookback_sec]
+        if not pts:
+            return []
+        n_buckets = max(1, int(lookback_sec // bucket_sec))
+        start = now - n_buckets * bucket_sec
+        closes: List[float] = []
+        last_close: Optional[float] = None
+        idx = 0
+        for b in range(n_buckets):
+            bucket_end = start + (b + 1) * bucket_sec
+            while idx < len(pts) and pts[idx][0] <= bucket_end:
+                last_close = pts[idx][1]
+                idx += 1
+            if last_close is not None:
+                closes.append(last_close)
+        return closes
+
+    def vwap(self, lookback_sec: int) -> Optional[float]:
+        """Volume-weighted average price over the lookback window."""
+        now = time.time()
+        with self._lock:
+            pts = [(p, q) for t, p, q in self._buf if now - t <= lookback_sec]
+        if not pts:
+            return None
+        total_qty = sum(q for _p, q in pts)
+        if total_qty <= 0:
+            return None
+        return sum(p * q for p, q in pts) / total_qty
+
+    def _push(self, ts: float, price: float, qty: float = 0.0) -> None:
         with self._lock:
             if price <= 0 or ts <= 0:
                 return  # malformed tick — never let it into the buffer
             if self._buf:
-                last_ts, last_price = self._buf[-1]
+                last_ts, last_price, _last_qty = self._buf[-1]
                 if last_price > 0 and abs(price - last_price) / last_price > 0.15:
                     return  # >15% single-tick jump is not a real trade — drop the outlier
-            self._buf.append((ts, price))
+            self._buf.append((ts, price, max(0.0, qty)))
             cutoff = ts - self.buffer_sec
             while self._buf and self._buf[0][0] < cutoff:
                 self._buf.popleft()
@@ -162,8 +198,9 @@ class BinanceFeed:
                         raw = await ws.recv()
                         msg = json.loads(raw)
                         price = float(msg["p"])
+                        qty = float(msg.get("q", 0.0))
                         ts = msg["T"] / 1000.0  # trade time, ms -> sec
-                        self._push(ts, price)
+                        self._push(ts, price, qty)
             except Exception as e:  # noqa: BLE001
                 self._connected = False
                 self._last_error = str(e)

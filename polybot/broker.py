@@ -38,6 +38,7 @@ class Position:
     entry_ts: float
     market_end_ts: float
     round_open_price: Optional[float] = None  # BTC reference price the round resolves against
+    entry_confidence: Optional[float] = None  # modeled win probability at entry, for calibration tracking
     status: str = "open"  # open | closed
     exit_price: Optional[float] = None
     exit_ts: Optional[float] = None
@@ -180,7 +181,13 @@ class Broker:
     # ---- trading ----
 
     def enter(
-        self, symbol: str, duration: str, market: ActiveMarket, side: str, round_open_price: Optional[float] = None
+        self,
+        symbol: str,
+        duration: str,
+        market: ActiveMarket,
+        side: str,
+        round_open_price: Optional[float] = None,
+        entry_confidence: Optional[float] = None,
     ) -> tuple[Optional[Position], str]:
         ok, reason = self.can_enter(symbol, duration)
         if not ok:
@@ -219,6 +226,7 @@ class Broker:
             entry_ts=time.time(),
             market_end_ts=market.end_ts,
             round_open_price=round_open_price,
+            entry_confidence=entry_confidence,
         )
         self.positions.append(pos)
         store.save_position(pos)
